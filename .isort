@@ -1,0 +1,2 @@
+[settings]
+skip=venv/,__pycache__/,.idea/
