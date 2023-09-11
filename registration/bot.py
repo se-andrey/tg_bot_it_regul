@@ -10,15 +10,9 @@ logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s 
 
 
 def is_valid_phone_number(phone_number):
-    pattern = r'^\d{10,18}$'
-    if re.match(pattern, phone_number) is None:
-        return False, "Введите номер телефона в формате: 1234567890\n" \
-                      "Для регистрации введите через пробел телефон, имя и фамилию"
-
     user_profile = UserProfile.objects.filter(phone_number=phone_number).first()
     if user_profile:
-        return False, "По указанному вами номеру телефона уже кто-то зарегистрирован.\n" \
-                      "Для регистрации введите через пробел телефон, имя и фамилию"
+        return False, "По указанному вами номеру телефона уже кто-то зарегистрирован."
     return True, "Номер телефона прошел валидацию"
 
 
@@ -27,6 +21,9 @@ class MyBot:
         self.bot = telebot.TeleBot(token)
         self.user_id = None
         self.editing_enabled = True
+        self.phone_number = None
+        self.last_name = ""
+        self.processed_message = False
 
     def start(self):
         @self.bot.message_handler(commands=['start'])
@@ -38,9 +35,7 @@ class MyBot:
             if user_profile and user_profile.is_registered:
                 self.show_profile(user_profile)
             elif user_profile and user_profile.accept_agreement:
-                self.bot.send_message(self.user_id,
-                                      "Для регистрации введите через пробел номер телефона, имя и фамилию")
-                self.bot.register_next_step_handler(message, self.process_registration)
+                self.share_contact()
             else:
 
                 markup = types.InlineKeyboardMarkup(row_width=2)
@@ -66,9 +61,8 @@ class MyBot:
                 if call.data == 'accept':
                     user_profile.accept_agreement = True
                     user_profile.save()
-                    self.bot.send_message(self.user_id, "Принято!\nДля регистрации введите через пробел "
-                                                        "номер телефона, имя и фамилию")
-                    self.bot.register_next_step_handler(call.message, self.process_registration)
+                    self.bot.send_message(self.user_id, "Принято!")
+                    self.share_contact()
                 elif call.data == 'decline':
                     self.bot.send_message(self.user_id, "Вы отказались от регистрации.")
             else:
@@ -101,46 +95,56 @@ class MyBot:
             self.editing_enabled = False
             self.bot.send_message(self.user_id, "Регистрация завершена")
 
-    def process_registration(self, message):
-        user_data = message.text.split()
-        if len(user_data) == 3:
-            phone_number, first_name, last_name = user_data
-            user_profile = UserProfile.objects.filter(user_id=self.user_id).first()
-            if user_profile:
-                phone_validation = is_valid_phone_number(phone_number)
-                if phone_validation[0]:
-                    if len(first_name) < 50 and len(last_name) < 50:
-                        user_profile.phone_number = phone_number
-                        user_profile.is_registered = True
-                        user_profile.first_name = first_name
-                        user_profile.last_name = last_name
-                        try:
-                            user_profile.save()
-                            logging.info(f"User {self.user_id} registered successfully.")
-                        except Exception as e:
-                            logging.error(f"Error while saving user profile for user {self.user_id}: {str(e)}")
-                            self.bot.send_message(self.user_id, "Произошла ошибка при внесении пользователя в базу.")
-                            self.bot.send_message(self.user_id, "Попробуйте зарегистрироваться еще раз\n"
-                                                                "Для регистрации введите через пробел телефон, "
-                                                                "имя и фамилию.")
-                            self.bot.register_next_step_handler(message, self.process_registration)
+        @self.bot.message_handler(content_types=['contact'])
+        def process_contact(message):
+            if self.processed_message:
+                return
+            self.processed_message = True
 
-                        self.show_profile(user_profile)
-                    else:
-                        self.bot.send_message(self.user_id, "Имя и фамилия должны быть длиной не более 50-и символов"
-                                                            "Для регистрации введите через пробел телефон, "
-                                                            "имя и фамилию")
-                        self.bot.register_next_step_handler(message, self.process_registration)
+            contact = message.contact
+            if contact.phone_number:
+                self.phone_number = contact.phone_number
+                if message.from_user.last_name is not None:
+                    self.last_name = message.from_user.last_name
+                if self.last_name == "":
+                    self.bot.send_message(self.user_id, "Для завершения регистрации введите вашу фамилию:")
+                    self.last_name = message.text
+                    self.bot.register_next_step_handler(message, self.add_last_name)
                 else:
-                    self.bot.send_message(self.user_id, phone_validation[1])
-                    self.bot.register_next_step_handler(message, self.process_registration)
+                    self.process_registration(message)
+                self.bot.send_message(self.user_id, f"Ваш номер телефона: {self.phone_number}")
             else:
-                self.bot.send_message(self.user_id, "Произошла ошибка при регистрации.")
+                self.bot.send_message(self.user_id, "Извините, но вы не поделились номером телефона.")
+
+    def process_registration(self, message):
+        first_name = message.from_user.first_name
+
+        user_profile = UserProfile.objects.filter(user_id=self.user_id).first()
+        if user_profile:
+
+            phone_validation = is_valid_phone_number(self.phone_number)
+            if phone_validation[0]:
+                user_profile.phone_number = self.phone_number
+                user_profile.is_registered = True
+                user_profile.first_name = first_name
+                user_profile.last_name = self.last_name
+                try:
+                    user_profile.save()
+                    logging.info(f"User {self.user_id} registered successfully.")
+                except Exception as e:
+                    logging.error(f"Error while saving user profile for user {self.user_id}: {str(e)}")
+                    self.bot.send_message(self.user_id, "Произошла ошибка при внесении пользователя в базу.")
+                    self.bot.send_message(self.user_id, "Попробуйте зарегистрироваться еще раз\n"
+                                                        "Для регистрации введите номер телефона")
+                    self.bot.register_next_step_handler(message, self.process_registration)
+
+                self.show_profile(user_profile)
+
+            else:
+                self.bot.send_message(self.user_id, phone_validation[1])
+                self.bot.register_next_step_handler(message, self.process_registration)
         else:
-            self.bot.send_message(self.user_id, "Произошла ошибка при регистрации.\n"
-                                                "Для регистрации введите через пробел телефон, имя и фамилию.\n"
-                                                "Никаких других данных вводит не нужно")
-            self.bot.register_next_step_handler(message, self.process_registration)
+            self.bot.send_message(self.user_id, "Произошла ошибка при регистрации.")
 
     def process_name(self, message):
         new_name = message.text
@@ -150,7 +154,7 @@ class MyBot:
             user_profile.first_name = new_name
             user_profile.is_changing_name = False
             try:
-                user_profile.save()
+                user_profile.save(update_fields=['first_name'])
                 logging.info(f"User {self.user_id} update first_name.")
             except Exception as e:
                 logging.error(f"Error while saving user profile for user {self.user_id}: {str(e)}")
@@ -165,7 +169,7 @@ class MyBot:
             user_profile.last_name = new_last_name
             user_profile.is_changing_last_name = False
             try:
-                user_profile.save()
+                user_profile.save(update_fields=['last_name'])
                 logging.info(f"User {self.user_id} update last_name.")
             except Exception as e:
                 logging.error(f"Error while saving user profile for user {self.user_id}: {str(e)}")
@@ -183,6 +187,17 @@ class MyBot:
         markup.add(edit_name_button, edit_last_name_button, finish_editing_button)
 
         self.bot.send_message(self.user_id, message_text, reply_markup=markup)
+
+    def share_contact(self):
+        markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+        phone_button = types.KeyboardButton(text="Поделиться номером телефона", request_contact=True)
+        markup.add(phone_button)
+        self.bot.send_message(self.user_id, "Для регистрации поделитесь своим номером телефона:",
+                              reply_markup=markup)
+
+    def add_last_name(self, message):
+        self.last_name = message.text
+        self.process_registration(message)
 
     def run(self):
         self.bot.polling(none_stop=True)
